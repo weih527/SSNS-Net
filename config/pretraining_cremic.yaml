@@ -1,0 +1,79 @@
+NAME: 'pretraining_cremic'
+
+MODEL:
+    model_type: 'superhuman'  # 'mala' or 'superhuman'
+    input_nc: 1
+    output_nc: 1
+    if_sigmoid: True
+    # for 'mala':
+    init_mode_mala: 'kaiming'
+    # for 'superhuman':
+    if_skip: 'False'
+    filters: 
+        - 28
+        - 36
+        - 48
+        - 64
+        - 80
+    upsample_mode: 'transposeS'  # 'bilinear', 'nearest', 'transpose', 'transposeS'
+    decode_ratio: 1
+    merge_mode: 'cat'  # 'add', 'cat'
+    pad_mode: 'zero'  # 'zero', 'replicate'
+    bn_mode: 'async'  # 'sync', 'async'
+    relu_mode: 'elu'  # 'elu', 'relu', 'leaky'
+    init_mode: 'kaiming_normal'  # 'kaiming_normal', 'kaiming_uniform', 'xavier_normal', 'xavier_uniform'
+
+TRAIN:
+    resume: False
+    if_valid: True
+    cache_path: './caches/'
+    save_path: './models/'
+    pad: 0
+    loss_func: 'L1'   # 'MSE', 'L1'
+
+    opt_type: 'adam'
+    total_iters: 400000
+    warmup_iters: 0
+    base_lr: 0.0001
+    end_lr: 0.0001
+    display_freq: 100
+    valid_freq: 1000
+    save_freq: 1000
+    decay_iters: 200000
+    weight_decay: ~
+    power: 1.5
+
+    batch_size: 4
+    num_workers: 4
+    if_cuda: True
+
+    random_seed: 555  # -1 is none
+
+DATA:
+    dataset_name: 'cremi-C'  # 'snemi3d-ac3', 'cremi-A', 'cremi-C'
+    unlabel_dataset: 'cremi-C'  # 'snemi3d-ac3', 'ac4_around', 'ac3_ac4', 'cremi-A', 'cremi'
+    train_split: 10
+    test_split: 25
+    unlabel_split: 100
+    data_folder: './data'
+    if_norm_images: False
+    if_scale_aug_labeled: False
+    scale_factor: 2
+    if_filp_aug_labeled: False
+    if_rotation_aug_labeled: False
+    if_intensity_aug_labeled: False
+    if_elastic_aug_labeled: False
+    if_noise_aug_labeled: True
+    min_noise_std: 0.01
+    max_noise_std: 0.2
+    if_order_aug: False
+    if_mask_aug: True
+    if_blur_aug_labeled: True
+    min_kernel_size: 3
+    max_kernel_size: 9
+    min_sigma: 0
+    max_sigma: 2
+
+TEST:
+    pad: 0
+    model_name: ' '
