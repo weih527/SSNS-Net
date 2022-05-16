@@ -3,40 +3,33 @@ from __future__ import print_function
 from __future__ import division
 
 import os
-from re import escape
 import sys
 import yaml
 import time
-import cv2
 import h5py
-import random
 import logging
 import argparse
 import numpy as np
-from PIL import Image
 from attrdict import AttrDict
 from tensorboardX import SummaryWriter
 from collections import OrderedDict
-import subprocess
-import multiprocessing as mp
-from sklearn.metrics import f1_score, average_precision_score, roc_auc_score
+from skimage.metrics import adapted_rand_error as adapted_rand_ref
+from skimage.metrics import variation_of_information as voi_ref
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
 
 from dataloader.data_provider_labeled import Provider
 from dataloader.data_provider_unlabel_ema import Provider as Provider_unlabel
 from dataloader.provider_valid import Provider_valid
-from loss.loss import BCELoss, WeightedBCELoss, MSELoss
 from loss.loss_unlabel import MSELoss_unlabel, BCELoss_unlabel
-from utils.show import show_affs, show_affs_whole, show_affs_pseudo
-# from utils.gen_pseudo import GenPseudo
+from utils.show import show_affs, show_affs_whole
 from utils.consistency_aug import convert_consistency_scale, convert_consistency_flip
 from model.unet3d_mala import UNet3D_MALA
 from model.model_superhuman import UNet_PNI
 from utils.utils import setup_seed, execute
+from utils.post_waterz import post_waterz
+from utils.post_lmc import post_lmc
 
 def sigmoid_rampup(current, rampup_length=40.0):
     """Exponential rampup from https://arxiv.org/abs/1610.02242"""
@@ -89,7 +82,6 @@ def init_project(cfg):
         model_name = prefix + '_' + cfg.NAME
     cfg.cache_path = os.path.join(cfg.TRAIN.cache_path, model_name)
     cfg.save_path = os.path.join(cfg.TRAIN.save_path, model_name)
-    # cfg.record_path = os.path.join(cfg.TRAIN.record_path, 'log')
     cfg.record_path = os.path.join(cfg.save_path, model_name)
     cfg.valid_path = os.path.join(cfg.save_path, 'valid')
     if cfg.TRAIN.resume is False:
@@ -108,7 +100,7 @@ def init_project(cfg):
     return writer
 
 def load_dataset(cfg):
-    print('Caching datasets ... ', end='', flush=True)
+    print('Caching datasets ... ', flush=True)
     t1 = time.time()
     train_provider = Provider('train', cfg)
     valid_provider = Provider_valid(cfg)
@@ -120,10 +112,7 @@ def build_model(cfg, writer, EMA=False):
     t1 = time.time()
     device = torch.device('cuda:0')
 
-    if cfg.TRAIN.train_strategy == 'feature_consistency':
-        show_feature = True
-    else:
-        show_feature = False
+    show_feature = False
 
     if cfg.MODEL.model_type == 'mala':
         print('load mala model!')
@@ -199,7 +188,6 @@ def resume_params(cfg, model, optimizer, resume):
         if os.path.isfile(model_path):
             checkpoint = torch.load(model_path)
             model.load_state_dict(checkpoint['model_weights'])
-            # optimizer.load_state_dict(checkpoint['optimizer_weights'])
         else:
             raise AttributeError('No checkpoint found at %s' % model_path)
         print('Done (time: %.2fs)' % (time.time() - t1))
@@ -230,16 +218,14 @@ def loop(cfg, train_provider, valid_provider, model, ema_model, criterion, optim
     sum_feature_loss = 0
     device = torch.device('cuda:0')
     
-    if cfg.TRAIN.loss_func == 'MSE':
-        criterion = MSELoss()
-    elif cfg.TRAIN.loss_func == 'WeightedBCELoss':
-        criterion = WeightedBCELoss()
+    if cfg.TRAIN.loss_func == 'MSELoss':
+        criterion = nn.MSELoss()
     elif cfg.TRAIN.loss_func == 'BCELoss':
-        criterion = BCELoss()
+        criterion = nn.BCELoss()
     else:
         raise AttributeError("NO this criterion")
 
-    if cfg.TRAIN.loss_func_unlabel == 'MSE':
+    if cfg.TRAIN.loss_func_unlabel == 'MSELoss':
         criterion_unlabel = MSELoss_unlabel()
     elif cfg.TRAIN.loss_func_unlabel == 'BCELoss':
         criterion_unlabel = BCELoss_unlabel()
@@ -247,6 +233,7 @@ def loop(cfg, train_provider, valid_provider, model, ema_model, criterion, optim
         raise AttributeError("NO this criterion")
 
     train_provider_unlabel = Provider_unlabel('train', cfg)
+
     try:
         valid_data = cfg.DATA.valid_dataset
     except:
@@ -270,6 +257,8 @@ def loop(cfg, train_provider, valid_provider, model, ema_model, criterion, optim
     start_split = cfg.DATA.test_split
     end_split = 0
     test_split = start_split - end_split
+    seg_name = 'waterz_' + valid_mode + '_' + str(test_split) + '.txt'
+    f_seg_txt = open(os.path.join(cfg.record_path, seg_name), 'a')
 
     while iters <= cfg.TRAIN.total_iters:
         # train
@@ -277,7 +266,7 @@ def loop(cfg, train_provider, valid_provider, model, ema_model, criterion, optim
         ema_model.train()
         iters += 1
         t1 = time.time()
-        inputs, target, weightmap = train_provider.next()
+        inputs, target, _ = train_provider.next()
         inputs_unlabel_aug, inputs_unlabel_gt, det_sizes, rules = train_provider_unlabel.next()
 
         # decay learning rate
@@ -289,123 +278,71 @@ def loop(cfg, train_provider, valid_provider, model, ema_model, criterion, optim
                 param_group['lr'] = current_lr
 
         optimizer.zero_grad()
-        if cfg.TRAIN.train_strategy == 'weight_sum':
-            # cat labeled and unlabeled data
-            batchsize = inputs.shape[0]
-            inputs_all = torch.cat([inputs, inputs_unlabel_aug], dim=0)
-            pred_all = model(inputs_all)
-            pred = pred_all[0:batchsize, ...]
-            pred_unlabel = pred_all[batchsize:, ...]
+        # cat labeled and unlabeled data
+        batchsize = inputs.shape[0]
+        inputs_all = torch.cat([inputs, inputs_unlabel_aug], dim=0)
+        pred_all = model(inputs_all)
+        pred = pred_all[0:batchsize, ...]
+        pred_unlabel = pred_all[batchsize:, ...]
 
-            with torch.no_grad():
-                pred_unlabel_gt = ema_model(inputs_unlabel_gt)
+        with torch.no_grad():
+            pred_unlabel_gt = ema_model(inputs_unlabel_gt)
 
-            # convert flip
-            if cfg.DATA.if_filp_aug_unlabel:
-                pred_unlabel_gt = convert_consistency_flip(pred_unlabel_gt, rules)
-            # gen pseudo label and mask
-            if cfg.DATA.if_scale_aug_unlabel:
-                pred_unlabel_gt, masks = convert_consistency_scale(pred_unlabel_gt, det_sizes)
-            else:
-                masks = torch.ones_like(pred_unlabel_gt)
+        # convert flip
+        if cfg.DATA.if_filp_aug_unlabel:
+            pred_unlabel_gt = convert_consistency_flip(pred_unlabel_gt, rules)
+        # gen pseudo label and mask
+        if cfg.DATA.if_scale_aug_unlabel:
+            pred_unlabel_gt, masks = convert_consistency_scale(pred_unlabel_gt, det_sizes)
+        else:
+            masks = torch.ones_like(pred_unlabel_gt)
 
-            ##############################
-            # LOSS
-            loss_labeled = criterion(pred, target, weightmap)
-            # loss_unlabel = cfg.TRAIN.weight_unlabel * criterion_unlabel(pred_unlabel, pred_unlabel_gt, masks)
+        ##############################
+        # LOSS
+        loss_labeled = criterion(pred, target)
+        if cfg.TRAIN.weight_unlabel_fixed:
+            loss_unlabel = cfg.TRAIN.weight_unlabel * criterion_unlabel(pred_unlabel, pred_unlabel_gt, masks)
+        else:
             max_iterations = 100000
             consistency_weight = get_current_consistency_weight(iters, consistency=cfg.TRAIN.weight_unlabel*0.1, consistency_rampup=max_iterations)
             loss_unlabel = consistency_weight * criterion_unlabel(pred_unlabel, pred_unlabel_gt, masks)
 
-            loss = loss_labeled + loss_unlabel
-            loss_features = 0
-            loss.backward()
-            ##############################
-        elif cfg.TRAIN.train_strategy == 'independent':
-            raise NotImplementedError
-        elif cfg.TRAIN.train_strategy == 'feature_consistency':
-            # copy from pre_training/scripts_integrate/main_ftconsist3.py
-            # raise NotImplementedError
-            # cat labeled and unlabeled data
-            batchsize = inputs.shape[0]
-            inputs_all = torch.cat([inputs, inputs_unlabel_aug], dim=0)
-            _, center_features_all, up_features_all, pred_all = model(inputs_all)
-            pred = pred_all[0:batchsize, ...]
-            pred_unlabel = pred_all[batchsize:, ...]
-
-            # split unlabeled data
-            pred_features_unlabel = []
-            for fea in center_features_all:
-                fea = fea[batchsize:, ...]
-                pred_features_unlabel.append(fea)
-            for fea in up_features_all:
-                fea = fea[batchsize:, ...]
-                pred_features_unlabel.append(fea)
-
-            with torch.no_grad():
-                _, center_features_gt, up_features_gt, pred_unlabel_gt = model(inputs_unlabel_gt)
-                pred_features_gt = center_features_gt + up_features_gt
-
-            # gen pseudo label and mask
-            pseudo_lb, masks = convert_consistency_scale(pred_unlabel_gt, det_sizes)
-
-            ##############################
-            # LOSS
-            loss_labeled = criterion(pred, target, weightmap)
-            loss_unlabel = cfg.TRAIN.weight_unlabel * criterion_unlabel(pred_unlabel, pseudo_lb, masks)
-
-            loss_features = 0
-            weight_feature = list(cfg.TRAIN.weight_feature)
-            for fea_id in range(len(pred_features_unlabel)):
-                masks = torch.ones_like(pred_features_unlabel[fea_id])
-                loss_features += weight_feature[fea_id] * criterion_unlabel(pred_features_unlabel[fea_id], pred_features_gt[fea_id], masks)
-
-            loss = loss_labeled + loss_unlabel + loss_features
-            loss.backward()
-        else:
-            raise AttributeError('No this training strategy!')
+        loss = loss_labeled + loss_unlabel
+        loss.backward()
+        ##############################
 
         if cfg.TRAIN.weight_decay is not None:
             for group in optimizer.param_groups:
                 for param in group['params']:
                     param.data = param.data.add(-cfg.TRAIN.weight_decay * group['lr'], param.data)
         optimizer.step()
-        ema_decay = cfg.TRAIN.ema_decay   # default=0.99
+        ema_decay = cfg.TRAIN.ema_decay   # default=0.999
         update_ema_variables(model, ema_model, ema_decay, iters)
 
         sum_loss += loss.item()
         sum_labeled_loss += loss_labeled.item()
         sum_unlabel_loss += loss_unlabel.item()
-        if cfg.TRAIN.train_strategy == 'feature_consistency':
-            try:
-                sum_feature_loss += loss_features.item()
-            except:
-                sum_feature_loss += loss_features
-        else:
-            sum_feature_loss = 0
         sum_time += time.time() - t1
 
         # log train
         if iters % cfg.TRAIN.display_freq == 0 or iters == 1:
             rcd_time.append(sum_time)
             if iters == 1:
-                logging.info('step %d, loss = %.6f, labeled_loss=%.6f, unlabel_loss=%.6f, feature_loss=%.6f (wt: *1, lr: %.8f, et: %.2f sec, rd: %.2f min)'
-                            % (iters, sum_loss, sum_labeled_loss, sum_unlabel_loss, sum_feature_loss, current_lr, sum_time,
+                logging.info('step %d, loss = %.6f, labeled_loss=%.6f, unlabel_loss=%.6f (wt: *1, lr: %.8f, et: %.2f sec, rd: %.2f min)'
+                            % (iters, sum_loss, sum_labeled_loss, sum_unlabel_loss, current_lr, sum_time,
                             (cfg.TRAIN.total_iters - iters) / cfg.TRAIN.display_freq * np.mean(np.asarray(rcd_time)) / 60))
                 writer.add_scalar('loss', sum_loss * 1, iters)
             else:
-                logging.info('step %d, loss = %.6f, labeled_loss=%.6f, unlabel_loss=%.6f, feature_loss=%.6f (wt: *1, lr: %.8f, et: %.2f sec, rd: %.2f min)' \
+                logging.info('step %d, loss = %.6f, labeled_loss=%.6f, unlabel_loss=%.6f (wt: *1, lr: %.8f, et: %.2f sec, rd: %.2f min)' \
                             % (iters, sum_loss / cfg.TRAIN.display_freq * 1, \
                             sum_labeled_loss / cfg.TRAIN.display_freq * 1, \
-                            sum_unlabel_loss / cfg.TRAIN.display_freq * 1, \
-                            sum_feature_loss / cfg.TRAIN.display_freq * 1, current_lr, sum_time, \
+                            sum_unlabel_loss / cfg.TRAIN.display_freq * 1, current_lr, sum_time, \
                             (cfg.TRAIN.total_iters - iters) / cfg.TRAIN.display_freq * np.mean(np.asarray(rcd_time)) / 60))
                 writer.add_scalar('loss', sum_loss / cfg.TRAIN.display_freq * 1, iters)
-            f_loss_txt.write('step = %d, loss = %.6f, labeled_loss=%.6f, unlabel_loss=%.6f, feature_loss=%.6f' \
+            f_loss_txt.write('step = %d, loss = %.6f, labeled_loss=%.6f, unlabel_loss=%.6f' \
                             % (iters, sum_loss / cfg.TRAIN.display_freq * 1, \
                             sum_labeled_loss / cfg.TRAIN.display_freq * 1, \
-                            sum_unlabel_loss / cfg.TRAIN.display_freq * 1, \
-                            sum_feature_loss / cfg.TRAIN.display_freq * 1))
+                            sum_unlabel_loss / cfg.TRAIN.display_freq * 1))
             f_loss_txt.write('\n')
             f_loss_txt.flush()
             sys.stdout.flush()
@@ -413,45 +350,56 @@ def loop(cfg, train_provider, valid_provider, model, ema_model, criterion, optim
             sum_loss = 0
             sum_labeled_loss = 0
             sum_unlabel_loss = 0
-            sum_feature_loss = 0
 
         # display
         if iters % cfg.TRAIN.valid_freq == 0 or iters == 1:
             # show_affs(iters, inputs, pred, target, cfg.cache_path, model_type=cfg.MODEL.model_type)
             show_affs(iters, inputs_unlabel_aug, pred_unlabel, pred_unlabel_gt, cfg.cache_path, model_type=cfg.MODEL.model_type)
-            # show_affs_pseudo(iters, inputs_unlabel_aug, pred_unlabel, pred_unlabel_gt, masks, cfg.cache_path, model_type=cfg.MODEL.model_type)
 
         # valid
         if cfg.TRAIN.if_valid:
             if iters % cfg.TRAIN.save_freq == 0 and iters >= cfg.TRAIN.min_valid_iters:
                 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
                 model.eval()
+                ema_model.eval()
                 dataloader = torch.utils.data.DataLoader(valid_provider, batch_size=1, num_workers=0,
                                                 shuffle=False, drop_last=False, pin_memory=True)
                 losses_valid = []
                 for k, batch in enumerate(dataloader, 0):
-                    inputs, target, weightmap = batch
+                    inputs, target, _ = batch
                     inputs = inputs.cuda()
                     target = target.cuda()
-                    weightmap = weightmap.cuda()
                     with torch.no_grad():
-                        if cfg.TRAIN.train_strategy == 'feature_consistency':
-                            _, _, _, pred = model(inputs)
-                        else:
-                            # pred = model(inputs)
-                            pred = ema_model(inputs)
-                    tmp_loss = criterion(pred, target, weightmap)
+                        # pred = model(inputs)
+                        pred = ema_model(inputs)
+                    tmp_loss = criterion(pred, target)
                     losses_valid.append(tmp_loss.item())
                     valid_provider.add_vol(np.squeeze(pred.data.cpu().numpy()))
                 epoch_loss = sum(losses_valid) / len(losses_valid)
                 out_affs = valid_provider.get_results()
-                gt_affs = valid_provider.get_gt_affs().copy()
+                gt_affs = valid_provider.get_gt_affs()
+                gt_seg = valid_provider.get_gt_lb()
                 valid_provider.reset_output()
                 show_affs_whole(iters, out_affs, gt_affs, cfg.valid_path)
 
-                f_affs = h5py.File(os.path.join(cfg.record_path, 'affs-%s-%d.hdf' % (valid_mode, test_split)), 'w')
-                f_affs.create_dataset('main', data=out_affs, dtype=np.float32, compression='gzip')
-                f_affs.close()
+                # f_affs = h5py.File(os.path.join(cfg.record_path, 'affs-%s-%d.hdf' % (valid_mode, test_split)), 'w')
+                # f_affs.create_dataset('main', data=out_affs, dtype=np.float32, compression='gzip')
+                # f_affs.close()
+
+                # for post-processing
+                # for python3
+                try:
+                    pred_seg = post_waterz(out_affs)
+                    # pred_seg = post_lmc(out_affs)
+                    arand = adapted_rand_ref(gt_seg, pred_seg, ignore_labels=(0))[0]
+                    voi_split, voi_merge = voi_ref(gt_seg, pred_seg, ignore_labels=(0))
+                    voi_sum = voi_split + voi_merge
+                except:
+                    print('model-%d, segmentation failed!' % iters)
+                    arand = 0.0
+                    voi_split = 0.0
+                    voi_merge = 0.0
+                    voi_sum = 0.0
 
                 # MSE
                 whole_mse = np.sum(np.square(out_affs - gt_affs)) / np.size(gt_affs)
@@ -467,20 +415,27 @@ def loop(cfg, train_provider, valid_provider, model, ema_model, criterion, optim
                                 (iters, epoch_loss, whole_mse, whole_bce))
                 f_valid_txt.write('\n')
                 f_valid_txt.flush()
+
+                print('model-%d, voi_split=%.6f, voi_merge=%.6f, voi_sum=%.6f, arand=%.6f' % \
+                    (iters, voi_split, voi_merge, voi_sum, arand))
+                f_seg_txt.write('model=%d, voi_split=%.6f, voi_merge=%.6f, voi_sum=%.6f, arand=%.6f' % \
+                            (iters, voi_split, voi_merge, voi_sum, arand))
+                f_seg_txt.write('\n')
+                f_seg_txt.flush()
                 torch.cuda.empty_cache()
 
-                try:
-                    # cmd_val = ['python2','evaluate_mala_models.py', '-in',cfg.record_path, '-gt',cfg.DATA.data_folder, '-id',str(iters), '-m',cfg.DATA.dataset_name, '-sn','valid_seg']
-                    seg_name1 = 'waterz_' + valid_mode + '_' + str(test_split)
-                    cmd_val = ['python2','evaluate_mala_models2.py', '-in',cfg.record_path, '-gt',cfg.DATA.data_folder, 
-                                '-id',str(iters), '-m',valid_mode, '-sn',seg_name1, '-ss',str(start_split),'-es',str(end_split)]
-                    for path in execute(cmd_val):
-                        print(path, end="")
-                except:
-                    print('model-%d, segmentation failed!' % iters)
+                # for post-processing
+                # for python2
+                # try:
+                #     seg_name1 = 'waterz_' + valid_mode + '_' + str(test_split)
+                #     cmd_val = ['python2','evaluate_mala_models2.py', '-in',cfg.record_path, '-gt',cfg.DATA.data_folder, 
+                #                 '-id',str(iters), '-m',valid_mode, '-sn',seg_name1, '-ss',str(start_split),'-es',str(end_split)]
+                #     for path in execute(cmd_val):
+                #         print(path, end="")
+                # except:
+                #     print('model-%d, segmentation failed!' % iters)
 
                 # try:
-                #     # cmd_val = ['python2','evaluate_mala_models.py', '-in',cfg.record_path, '-gt',cfg.DATA.data_folder, '-id',str(iters), '-m',cfg.DATA.dataset_name, '-sn','valid_seg']
                 #     seg_name2 = 'lmc_' + valid_mode + '_' + str(test_split)
                 #     cmd_val = ['python','evaluate_lmc_models.py', '-in',cfg.record_path, '-gt',cfg.DATA.data_folder, 
                 #                 '-id',str(iters), '-m',valid_mode, '-sn',seg_name2, '-ss',str(start_split),'-es',str(end_split)]
@@ -492,7 +447,7 @@ def loop(cfg, train_provider, valid_provider, model, ema_model, criterion, optim
         # save
         if iters % cfg.TRAIN.save_freq == 0:
             states = {'current_iter': iters, 'valid_result': None,
-                    'model_weights': model.state_dict()}
+                    'model_weights': ema_model.state_dict()}
             torch.save(states, os.path.join(cfg.save_path, 'model-%06d.ckpt' % iters))
             print('***************save modol, iters = %d.***************' % (iters), flush=True)
     f_loss_txt.close()
@@ -500,7 +455,6 @@ def loop(cfg, train_provider, valid_provider, model, ema_model, criterion, optim
 
 
 if __name__ == "__main__":
-    # mp.set_start_method('spawn')
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--cfg', type=str, default='seg_inpainting', help='path to config file')
     parser.add_argument('-m', '--mode', type=str, default='train', help='path to config file')
@@ -527,8 +481,6 @@ if __name__ == "__main__":
         ema_model = build_model(cfg, writer, EMA=True)
         optimizer = torch.optim.Adam(model.parameters(), lr=cfg.TRAIN.base_lr, betas=(0.9, 0.999),
                                     eps=0.01, weight_decay=1e-6, amsgrad=True)
-        # optimizer = optim.Adam(model.parameters(), lr=cfg.TRAIN.base_lr, betas=(0.9, 0.999), eps=1e-8, amsgrad=False)
-        # optimizer = optim.Adamax(model.parameters(), lr=cfg.TRAIN.base_l, eps=1e-8)
         model, optimizer, init_iters = resume_params(cfg, model, optimizer, cfg.TRAIN.resume)
         loop(cfg, train_provider, valid_provider, model, ema_model, nn.L1Loss(), optimizer, init_iters, writer)
         writer.close()

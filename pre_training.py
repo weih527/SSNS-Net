@@ -6,29 +6,20 @@ import os
 import sys
 import yaml
 import time
-import cv2
-import random
 import logging
 import argparse
 import numpy as np
-from PIL import Image
 from attrdict import AttrDict
 from tensorboardX import SummaryWriter
-from collections import OrderedDict
-import multiprocessing as mp
-from sklearn.metrics import f1_score
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
 
 from dataloader.data_provider_pretraining import Provider
 from dataloader.provider_valid_pretraining import Provider_valid
-from loss.loss import BCELoss, WeightedBCELoss, MSELoss
 from utils.show import show_affs, show_affs_whole
 from model.unet3d_mala import UNet3D_MALA
-from model.model_superhuman import UNet_PNI, UNet_PNI_Noskip, UNet_PNI_Noskip2
+from model.model_superhuman import UNet_PNI, UNet_PNI_Noskip
 from utils.utils import setup_seed
 
 
@@ -64,7 +55,6 @@ def init_project(cfg):
         model_name = prefix + '_' + cfg.NAME
     cfg.cache_path = os.path.join(cfg.TRAIN.cache_path, model_name)
     cfg.save_path = os.path.join(cfg.TRAIN.save_path, model_name)
-    # cfg.record_path = os.path.join(cfg.TRAIN.record_path, 'log')
     cfg.record_path = os.path.join(cfg.save_path, model_name)
     cfg.valid_path = os.path.join(cfg.save_path, 'valid')
     if cfg.TRAIN.resume is False:
@@ -83,7 +73,7 @@ def init_project(cfg):
     return writer
 
 def load_dataset(cfg):
-    print('Caching datasets ... ', end='', flush=True)
+    print('Caching datasets ... ', flush=True)
     t1 = time.time()
     train_provider = Provider('train', cfg)
     valid_provider = Provider_valid(cfg)
@@ -124,19 +114,6 @@ def build_model(cfg, writer):
                                     relu_mode=cfg.MODEL.relu_mode,
                                     init_mode=cfg.MODEL.init_mode,
                                     if_sigmoid=cfg.MODEL.if_sigmoid).to(device)
-        elif cfg.MODEL.if_skip == 'False2':
-            print('load superhuman model without skip2!')
-            model = UNet_PNI_Noskip2(in_planes=cfg.MODEL.input_nc,
-                                    out_planes=cfg.MODEL.output_nc,
-                                    filters=cfg.MODEL.filters,
-                                    upsample_mode=cfg.MODEL.upsample_mode,
-                                    decode_ratio=cfg.MODEL.decode_ratio,
-                                    merge_mode=cfg.MODEL.merge_mode,
-                                    pad_mode=cfg.MODEL.pad_mode,
-                                    bn_mode=cfg.MODEL.bn_mode,
-                                    relu_mode=cfg.MODEL.relu_mode,
-                                    init_mode=cfg.MODEL.init_mode,
-                                    if_sigmoid=cfg.MODEL.if_sigmoid).to(device)
         else:
             raise AttributeError('No this skip mode!')
 
@@ -161,7 +138,6 @@ def resume_params(cfg, model, optimizer, resume):
         if os.path.isfile(model_path):
             checkpoint = torch.load(model_path)
             model.load_state_dict(checkpoint['model_weights'])
-            # optimizer.load_state_dict(checkpoint['optimizer_weights'])
         else:
             raise AttributeError('No checkpoint found at %s' % model_path)
         print('Done (time: %.2fs)' % (time.time() - t1))
@@ -203,7 +179,7 @@ def loop(cfg, train_provider, valid_provider, model, criterion, optimizer, iters
         model.train()
         iters += 1
         t1 = time.time()
-        inputs, target, _ = train_provider.next()
+        inputs, target = train_provider.next()
         
         # decay learning rate
         if cfg.TRAIN.end_lr == cfg.TRAIN.base_lr:
@@ -265,7 +241,7 @@ def loop(cfg, train_provider, valid_provider, model, criterion, optimizer, iters
                                              shuffle=False, drop_last=False, pin_memory=True)
             losses_valid = []
             for k, batch in enumerate(dataloader, 0):
-                inputs, target, _ = batch
+                inputs, target = batch
                 inputs = inputs.cuda()
                 target = target.cuda()
                 with torch.no_grad():
@@ -280,27 +256,17 @@ def loop(cfg, train_provider, valid_provider, model, criterion, optimizer, iters
 
             # MSE
             whole_mse = np.sum(np.square(out_affs - gt_affs)) / np.size(gt_affs)
-            whole_bce = 0.0
-            whole_arand = 0.0
 
             out_affs_show = np.repeat(out_affs, 3, 0)
             gt_affs_show = np.repeat(gt_affs, 3, 0)
             show_affs_whole(iters, out_affs_show, gt_affs_show, cfg.valid_path)
 
-            # out_affs = np.clip(out_affs, 0.000001, 0.999999)
-            # bce = -(gt_affs * np.log(out_affs) + (1 - gt_affs) * np.log(1 - out_affs))
-            # whole_bce = np.sum(bce) / np.size(gt_affs)
-            # out_affs[out_affs <= 0.5] = 0
-            # out_affs[out_affs > 0.5] = 1
-            # whole_arand = 1 - f1_score(gt_affs.astype(np.uint8).flatten(), out_affs.astype(np.uint8).flatten())
-            print('model-%d, valid-loss=%.6f, MSE-loss=%.6f, BCE-loss=%.6f, ARAND-loss=%.6f' % \
-                (iters, epoch_loss, whole_mse, whole_bce, whole_arand), flush=True)
+            print('model-%d, valid-loss=%.6f, MSE-loss=%.6f' % \
+                (iters, epoch_loss, whole_mse), flush=True)
             writer.add_scalar('valid/epoch_loss', epoch_loss, iters)
             writer.add_scalar('valid/mse_loss', whole_mse, iters)
-            writer.add_scalar('valid/bce_loss', whole_bce, iters)
-            writer.add_scalar('valid/arand_loss', whole_arand, iters)
-            f_valid_txt.write('model-%d, valid-loss=%.6f, MSE-loss=%.6f, BCE-loss=%.6f, ARAND-loss=%.6f' % \
-                            (iters, epoch_loss, whole_mse, whole_bce, whole_arand))
+            f_valid_txt.write('model-%d, valid-loss=%.6f, MSE-loss=%.6f' % \
+                            (iters, epoch_loss, whole_mse))
             f_valid_txt.write('\n')
             f_valid_txt.flush()
             torch.cuda.empty_cache()
@@ -316,7 +282,6 @@ def loop(cfg, train_provider, valid_provider, model, criterion, optimizer, iters
 
 
 if __name__ == "__main__":
-    # mp.set_start_method('spawn')
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--cfg', type=str, default='seg_inpainting', help='path to config file')
     parser.add_argument('-m', '--mode', type=str, default='train', help='path to config file')
@@ -342,8 +307,6 @@ if __name__ == "__main__":
         model = build_model(cfg, writer)
         optimizer = torch.optim.Adam(model.parameters(), lr=cfg.TRAIN.base_lr, betas=(0.9, 0.999),
                                  eps=0.01, weight_decay=1e-6, amsgrad=True)
-        # optimizer = optim.Adam(model.parameters(), lr=cfg.TRAIN.base_lr, betas=(0.9, 0.999), eps=1e-8, amsgrad=False)
-        # optimizer = optim.Adamax(model.parameters(), lr=cfg.TRAIN.base_l, eps=1e-8)
         model, optimizer, init_iters = resume_params(cfg, model, optimizer, cfg.TRAIN.resume)
         loop(cfg, train_provider, valid_provider, model, nn.L1Loss(), optimizer, init_iters, writer)
         writer.close()
