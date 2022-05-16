@@ -179,8 +179,42 @@ def apply_transformation(image,
                             mode='constant',
                             cval=outside_value)
 
+def resize_3d(imgs, det_size, mode='linear'):
+    new_imgs = []
+    for k in range(imgs.shape[0]):
+        temp = imgs[k]
+        if mode == 'linear':
+            temp = cv2.resize(temp, (det_size, det_size), interpolation=cv2.INTER_LINEAR)
+        elif mode == 'nearest':
+            temp = cv2.resize(temp, (det_size, det_size), interpolation=cv2.INTER_NEAREST)
+        else:
+            raise AttributeError('No this interpolation mode!')
+        new_imgs.append(temp)
+    new_imgs = np.asarray(new_imgs)
+    return new_imgs
+
 ########################################################################
 
+class Rescale(object):
+    def __init__(self, scale_factor=2, det_shape=[18, 160, 160]):
+        super(Rescale, self).__init__()
+        self.scale_factor = scale_factor
+        self.det_shape = det_shape
+
+    def __call__(self, data, mask):
+        src_shape = data.shape
+        assert src_shape[-1] >= self.det_shape[-1] * self.scale_factor, 'data shape must be 160*2'
+        min_size = self.det_shape[-1] // self.scale_factor
+        max_size = self.det_shape[-1] * self.scale_factor
+        scale_size = random.randint(min_size // 2, max_size // 2)
+        scale_size = scale_size * 2
+
+        if scale_size < src_shape[-1]:
+            shift = (src_shape[-1] - scale_size) // 2
+            data = data[:, shift:-shift, shift:-shift]
+        data = resize_3d(data, self.det_shape[-1], mode='linear')
+        mask = resize_3d(mask, self.det_shape[-1], mode='nearest')
+        return data, mask, scale_size
 
 class SimpleAugment(object):
     def __init__(self, skip_ratio=0.5):
