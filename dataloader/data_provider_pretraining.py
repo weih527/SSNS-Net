@@ -4,7 +4,6 @@ from __future__ import division
 
 import os
 import sys
-import cv2
 import h5py
 import math
 import time
@@ -12,27 +11,30 @@ import torch
 import random
 import numpy as np
 from PIL import Image
-import multiprocessing
-from joblib import Parallel
-from joblib import delayed
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 
-# from utils.augmentation_affine import SegCVTransformRandomCropRotateScale, SegCVTransformRandomFlip
-# from utils.affine import identity_xf
-from utils.augmentation import SimpleAugment, RandomRotationAugment
-from utils.augmentation import IntensityAugment, ElasticAugment
-from utils.consistency_aug import order_aug, gen_mask, resize_3d, add_gauss_noise, add_gauss_blur
+from utils.augmentation import SimpleAugment
+from utils.consistency_aug_perturbations import Rescale
+from utils.consistency_aug_perturbations import Filp
+from utils.consistency_aug_perturbations import Intensity
+from utils.consistency_aug_perturbations import GaussBlur
+from utils.consistency_aug_perturbations import GaussNoise
+from utils.consistency_aug_perturbations import Cutout
+from utils.consistency_aug_perturbations import SobelFilter
+from utils.consistency_aug_perturbations import Mixup
+from utils.consistency_aug_perturbations import Elastic
+from utils.consistency_aug_perturbations import Artifact
+from utils.consistency_aug_perturbations import Missing
+from utils.consistency_aug_perturbations import BlurEnhanced
 
 
 class Train(Dataset):
 	def __init__(self, cfg):
 		super(Train, self).__init__()
-		# multiprocess settings
-		num_cores = multiprocessing.cpu_count()
-		self.parallel = Parallel(n_jobs=num_cores, backend='threading')
 		self.cfg = cfg
 		self.model_type = cfg.MODEL.model_type
+		self.per_mode = cfg.DATA.per_mode
 
 		# basic settings
 		# the input size of network
@@ -51,16 +53,27 @@ class Train(Dataset):
 		self.out_size = [self.crop_size[k] - 2 * self.net_padding[k] for k in range(len(self.crop_size))]
 
 		# training dataset files (h5), may contain many datasets
-		if cfg.DATA.unlabel_dataset == 'cremi_all':
+		if cfg.DATA.unlabel_dataset == 'cremi-A-100':
 			self.sub_path = 'cremi'
-			self.train_datasets = ['cremiA_inputs_interp.h5', 'cremiB_inputs_interp.h5', 'cremiC_inputs_interp.h5']
-		elif cfg.DATA.unlabel_dataset == 'cremi_test':
+			self.train_datasets = ['cremiA_inputs_interp.h5']
+		elif cfg.DATA.unlabel_dataset == 'cremi-A-200':
 			self.sub_path = 'cremi'
-			self.train_datasets = ['cremiA_inputs_interp.h5', 'cremiB_inputs_interp.h5', 'cremiC_inputs_interp.h5', \
-								'cremiA+_inputs_interp.h5', 'cremiB+_inputs_interp.h5', 'cremiC+_inputs_interp.h5']
-		elif cfg.DATA.unlabel_dataset == 'cremi-C':
+			self.train_datasets = ['cremiA_inputs_interp.h5', 'cremiA+_inputs_interp.h5']
+		elif cfg.DATA.unlabel_dataset == 'cremi-B-100':
+			self.sub_path = 'cremi'
+			self.train_datasets = ['cremiB_inputs_interp.h5']
+		elif cfg.DATA.unlabel_dataset == 'cremi-B-200':
+			self.sub_path = 'cremi'
+			self.train_datasets = ['cremiB_inputs_interp.h5', 'cremiB+_inputs_interp.h5']
+		elif cfg.DATA.unlabel_dataset == 'cremi-C-100':
+			self.sub_path = 'cremi'
+			self.train_datasets = ['cremiC_inputs_interp.h5']
+		elif cfg.DATA.unlabel_dataset == 'cremi-C-200':
 			self.sub_path = 'cremi'
 			self.train_datasets = ['cremiC_inputs_interp.h5', 'cremiC+_inputs_interp.h5']
+		elif cfg.DATA.unlabel_dataset == 'cremi-all':
+			self.sub_path = 'cremi'
+			self.train_datasets = ['cremiA_inputs_interp.h5', 'cremiB_inputs_interp.h5', 'cremiC_inputs_interp.h5']
 		elif cfg.DATA.unlabel_dataset == 'snemi3d-ac3' or cfg.DATA.unlabel_dataset == 'snemi3d':
 			self.sub_path = 'snemi3d'
 			self.train_datasets = ['AC3_inputs.h5']
@@ -71,7 +84,7 @@ class Train(Dataset):
 			self.sub_path = 'snemi3d'
 			self.train_datasets = ['AC3_inputs.h5', 'AC4_inputs.h5']
 			self.train_datasets += list(cfg.DATA.unlabel_datalist)
-		elif cfg.DATA.unlabel_dataset == 'fib-25':
+		elif cfg.DATA.unlabel_dataset == 'fib-25' or cfg.DATA.unlabel_dataset == 'fib':
 			self.sub_path = 'fib'
 			self.train_datasets = ['fib_inputs.h5']
 		else:
@@ -85,36 +98,29 @@ class Train(Dataset):
 		self.unlabel_split = cfg.DATA.unlabel_split
 
 		# augmentation
+		self.simple_aug = SimpleAugment()
 		self.if_norm_images = cfg.DATA.if_norm_images
-		self.if_scale_aug = cfg.DATA.if_scale_aug_labeled
+		self.if_scale_aug = False
 		self.scale_factor = cfg.DATA.scale_factor
-		self.if_filp_aug = cfg.DATA.if_filp_aug_labeled
-		self.if_rotation_aug = cfg.DATA.if_rotation_aug_labeled
-		self.if_intensity_aug = cfg.DATA.if_intensity_aug_labeled
-		self.if_elastic_aug = cfg.DATA.if_elastic_aug_labeled
-		self.if_noise_aug = cfg.DATA.if_noise_aug_labeled
+		self.if_filp_aug = False
+		self.if_rotation_aug = False
+		self.if_intensity_aug = cfg.DATA.if_intensity_aug_unlabel
+		self.if_elastic_aug = cfg.DATA.if_elastic_aug_unlabel
+		self.if_noise_aug = cfg.DATA.if_noise_aug_unlabel
 		self.min_noise_std = cfg.DATA.min_noise_std
 		self.max_noise_std = cfg.DATA.max_noise_std
-		self.if_order_aug = cfg.DATA.if_order_aug
-		self.if_mask_aug = cfg.DATA.if_mask_aug
-		self.if_blur_aug = cfg.DATA.if_blur_aug_labeled
+		self.if_mask_aug = cfg.DATA.if_mask_aug_unlabel
+		self.if_blur_aug = cfg.DATA.if_blur_aug_unlabel
 		self.min_kernel_size = cfg.DATA.min_kernel_size
 		self.max_kernel_size = cfg.DATA.max_kernel_size
 		self.min_sigma = cfg.DATA.min_sigma
 		self.max_sigma = cfg.DATA.max_sigma
-		# self.scale_aug = SegCVTransformRandomCropRotateScale(crop_size=self.crop_size[1:3],
-		# 													crop_offset=(16.0, 16.0),
-		# 													rot_mag=45.0,
-		# 													max_scale=1.1,
-		# 													uniform_scale=True,
-		# 													constrain_rot_scale=True)
-		# self.filp_aug = SegCVTransformRandomFlip(hflip=True, vflip=True, hvflip=True)
-		self.simple_aug = SimpleAugment()
-		self.rotation_aug = RandomRotationAugment()
-		self.intensity_aug = IntensityAugment()
-		self.elastic_aug = ElasticAugment(control_point_spacing=[4, 40, 40],
-										jitter_sigma=[0, 2, 2],
-										padding=20)
+		self.if_sobel_aug = cfg.DATA.if_sobel_aug_unlabel
+		self.if_mixup_aug = cfg.DATA.if_mixup_aug_unlabel
+		self.if_misalign_aug = cfg.DATA.if_misalign_aug_unlabel
+		self.if_artifact_aug = cfg.DATA.if_artifact_aug_unlabel
+		self.if_missing_aug = cfg.DATA.if_missing_aug_unlabel
+		self.if_blurenhanced_aug = cfg.DATA.if_blurenhanced_aug_unlabel
 
 		# load dataset
 		self.dataset = []
@@ -124,12 +130,10 @@ class Train(Dataset):
 			f_raw = h5py.File(os.path.join(self.folder_name, self.train_datasets[k]), 'r')
 			data = f_raw['main'][:]
 			f_raw.close()
-			if 'fib' in cfg.DATA.unlabel_dataset:
-				if data.shape[0] > self.unlabel_split:
-					data = data[:self.unlabel_split]
-			else:
-				if data.shape[0] > self.unlabel_split:
-					data = data[-self.unlabel_split:]
+			if data.shape[0] > self.unlabel_split:
+				# The default is to use the bottom 100 sections of volumes as unlabeled data for simplicity
+				# However, you can use any other sections (except from labeled sections) as unlabeled data according to your needs
+				data = data[-self.unlabel_split:]
 			self.dataset.append(data)
 
 		# padding by 'reflect' mode for mala network
@@ -142,27 +146,12 @@ class Train(Dataset):
 		# the training dataset size
 		self.raw_data_shape = list(self.dataset[0].shape)
 
-		# padding for random rotation
-		self.crop_from_origin = [0, 0, 0]
-		self.padding = 60
-		if self.if_rotation_aug:
-			self.crop_from_origin[0] = self.crop_size[0]
-			self.crop_from_origin[1] = self.crop_size[1] + 2 * self.padding
-			self.crop_from_origin[2] = self.crop_size[2] + 2 * self.padding
-		else:
-			self.crop_from_origin = self.crop_size
+		# padding for augmentation
+		self.sub_padding = [0, 80, 80]  # for rescale
+		self.crop_from_origin = [self.crop_size[i] + 2*self.sub_padding[i] for i in range(len(self.sub_padding))]
 
-		# mask size
-		if cfg.MODEL.model_type == 'mala':
-			self.min_mask_size = [5, 5, 5]
-			self.max_mask_size = [8, 12, 12]
-			self.min_mask_counts = 40
-			self.max_mask_counts = 60
-		else:
-			self.min_mask_size = [5, 10, 10]
-			self.max_mask_size = [10, 20, 20]
-			self.min_mask_counts = 60
-			self.max_mask_counts = 100
+		# perturbations
+		self.perturbations_init()
 
 	def __getitem__(self, index):
 		# random select one dataset if contain many datasets
@@ -170,137 +159,124 @@ class Train(Dataset):
 		used_data = self.dataset[k]
 
 		# random select one sub-volume
-		if self.if_scale_aug:
-			if random.random() > 0.5:
-				min_size = self.crop_from_origin[-1] // self.scale_factor
-				max_size = self.crop_from_origin[-1] * self.scale_factor
-				det_size = random.randint(min_size // 2, max_size // 2)
-				det_size = det_size * 2
-				det_crop_size = [self.crop_from_origin[0], det_size, det_size]
-			else:
-				det_size = self.crop_from_origin[-1]
-				det_crop_size = self.crop_from_origin
-		else:
-			det_size = self.crop_from_origin[-1]
-			det_crop_size = self.crop_from_origin
-		random_z = random.randint(0, self.raw_data_shape[0]-det_crop_size[0])
-		random_y = random.randint(0, self.raw_data_shape[1]-det_crop_size[1])
-		random_x = random.randint(0, self.raw_data_shape[2]-det_crop_size[2])
-		imgs = used_data[random_z:random_z+det_crop_size[0], \
-						random_y:random_y+det_crop_size[1], \
-						random_x:random_x+det_crop_size[2]].copy()
-
-		if imgs.shape[-1] != self.crop_from_origin[-1]:
-			imgs = resize_3d(imgs, self.crop_from_origin[-1], mode='linear').astype(np.uint8)
+		random_z = random.randint(0, self.raw_data_shape[0]-self.crop_from_origin[0])
+		random_y = random.randint(0, self.raw_data_shape[1]-self.crop_from_origin[1])
+		random_x = random.randint(0, self.raw_data_shape[2]-self.crop_from_origin[2])
+		imgs = used_data[random_z:random_z+self.crop_from_origin[0], \
+						random_y:random_y+self.crop_from_origin[1], \
+						random_x:random_x+self.crop_from_origin[2]].copy()
 
 		# do augmentation
 		imgs = imgs.astype(np.float32) / 255.0
 		[imgs] = self.simple_aug([imgs])
-		gt = imgs.copy()
+		gt_imgs = imgs[:, self.sub_padding[-1]:-self.sub_padding[-1], self.sub_padding[-1]:-self.sub_padding[-1]]
+		imgs, _, _, _ = self.apply_perturbations(imgs, None, mode=self.per_mode)
 
-		if self.if_intensity_aug:
-			imgs = self.intensity_aug(imgs)
-		if self.if_rotation_aug:
-			imgs = self.rotation_aug(imgs)
-			imgs = imgs[:, self.padding:-self.padding, self.padding:-self.padding]
-		if self.if_elastic_aug:
-			imgs = self.elastic_aug(imgs)
-		if self.if_order_aug:
-			imgs = order_aug(imgs, num_patch=4)
-		if self.if_noise_aug:
-			if random.random() > 0.5:
-				imgs = add_gauss_noise(imgs, min_std=self.min_noise_std, max_std=self.max_noise_std, norm_mode='trunc')
-		if self.if_blur_aug:
-			if random.random() > 0.5:
-				kernel_size = random.randint(self.min_kernel_size // 2, self.max_kernel_size // 2)
-				kernel_size = kernel_size * 2 + 1
-				sigma = random.uniform(self.min_sigma, self.max_sigma)
-				imgs = add_gauss_blur(imgs, kernel_size=kernel_size, sigma=sigma)
-		if self.if_mask_aug:
-			if random.random() > 0.5:
-				mask = gen_mask(imgs, model_type=self.model_type, \
-								min_mask_counts=self.min_mask_counts, \
-								max_mask_counts=self.max_mask_counts, \
-								min_mask_size=self.min_mask_size, \
-								max_mask_size=self.max_mask_size)
-				imgs = imgs * mask
-
-		# Norm images
-		if self.if_norm_images:
-			imgs = (imgs - 0.5) / 0.5
 		# extend dimension
 		imgs = imgs[np.newaxis, ...]
-		gt = gt[np.newaxis, ...]
+		gt_imgs = gt_imgs[np.newaxis, ...]
 		imgs = np.ascontiguousarray(imgs, dtype=np.float32)
-		gt = np.ascontiguousarray(gt, dtype=np.float32)
-		return imgs, gt, gt
+		gt_imgs = np.ascontiguousarray(gt_imgs, dtype=np.float32)
+		return imgs, gt_imgs
+
+	def perturbations_init(self):
+		self.per_rescale = Rescale(scale_factor=self.scale_factor, det_shape=self.crop_size)
+		self.per_flip = Filp()
+		self.per_intensity = Intensity()
+		self.per_gaussnoise = GaussNoise(min_std=self.min_noise_std, max_std=self.max_noise_std, norm_mode='trunc')
+		self.per_gaussblur = GaussBlur(min_kernel=self.min_kernel_size, max_kernel=self.max_kernel_size, min_sigma=self.min_sigma, max_sigma=self.max_sigma)
+		self.per_cutout = Cutout(model_type=self.model_type)
+		self.per_sobel = SobelFilter(if_mean=True)
+		self.per_mixup = Mixup(min_alpha=0.1, max_alpha=0.4)
+		self.per_misalign = Elastic(control_point_spacing=[4, 40, 40], jitter_sigma=[0, 0, 0], prob_slip=0.2, prob_shift=0.2, max_misalign=17, padding=20)
+		self.per_elastic = Elastic(control_point_spacing=[4, 40, 40], jitter_sigma=[0, 2, 2], padding=20)
+		self.per_artifact = Artifact(min_sec=1, max_sec=5)
+		self.per_missing = Missing(miss_fully_ratio=0.2, miss_part_ratio=0.5)
+		self.per_blurenhanced = BlurEnhanced(blur_fully_ratio=0.5, blur_part_ratio=0.7)
+
+	def apply_perturbations(self, data, auxi=None, mode=1):
+		all_pers = [self.if_scale_aug, self.if_filp_aug, self.if_rotation_aug, self.if_intensity_aug, \
+					self.if_noise_aug, self.if_blur_aug, self.if_mask_aug, self.if_sobel_aug, \
+					self.if_mixup_aug, self.if_misalign_aug, self.if_elastic_aug, self.if_artifact_aug, \
+					self.if_missing_aug, self.if_blurenhanced_aug]
+		if mode == 1:
+			# select used perturbations
+			used_pers = []
+			for k, value in enumerate(all_pers):
+				if value:
+					used_pers.append(k)
+			# select which one perturbation to use
+			if len(used_pers) == 0:
+				# do nothing
+				# must crop
+				data = data[:, self.sub_padding[-1]:-self.sub_padding[-1], self.sub_padding[-1]:-self.sub_padding[-1]]
+				scale_size = data.shape[-1]
+				rule = np.asarray([0,0,0,0], dtype=np.int32)
+				rotnum = 0
+				return data, scale_size, rule, rotnum
+			elif len(used_pers) == 1:
+				# No choise if only one perturbation can be used
+				rand_per = used_pers[0]
+			else:
+				rand_per = random.choice(used_pers)
+			# do augmentation
+			# resize
+			if rand_per == 0:
+				data, scale_size = self.per_rescale(data)
+			else:
+				data = data[:, self.sub_padding[-1]:-self.sub_padding[-1], self.sub_padding[-1]:-self.sub_padding[-1]]
+				scale_size = data.shape[-1]
+			# flip
+			if rand_per == 1:
+				data, rule = self.per_flip(data)
+			else:
+				rule = np.asarray([0,0,0,0], dtype=np.int32)
+			# rotation
+			if rand_per == 2:
+				rotnum = random.randint(0, 3)
+				data = np.rot90(data, k=rotnum, axes=(1,2))
+			else:
+				rotnum = 0
+			# intensity
+			if rand_per == 3:
+				data = self.per_intensity(data)
+			# noise
+			if rand_per == 4:
+				data = self.per_gaussnoise(data)
+			# blur
+			if rand_per == 5:
+				data = self.per_gaussblur(data)
+			# mask or cutout
+			if rand_per == 6:
+				data = self.per_cutout(data)
+			# sobel
+			if rand_per == 7:
+				data = self.per_sobel(data)
+			# mixup
+			if rand_per == 8 and auxi is not None:
+				data = self.per_mixup(data, auxi)
+			# misalign
+			if rand_per == 9:
+				data = self.per_misalign(data)
+			# elastic
+			if rand_per == 10:
+				data = self.per_elastic(data)
+			# artifact
+			if rand_per == 11:
+				data = self.per_artifact(data)
+			# missing section
+			if rand_per == 12:
+				data = self.per_missing(data)
+			# blur enhanced
+			if rand_per == 13:
+				data = self.per_blurenhanced(data)
+		else:
+			raise NotImplementedError
+		return data, scale_size, rule, rotnum
 
 	def __len__(self):
 		return int(sys.maxsize)
 
-
-def simple_augment(data, rule):
-	assert np.size(rule) == 4
-	assert data.ndim == 3
-	# z reflection
-	if rule[0]:
-		data = data[::-1, :, :]
-	# x reflection
-	if rule[1]:
-		data = data[:, :, ::-1]
-	# y reflection
-	if rule[2]:
-		data = data[:, ::-1, :]
-	# transpose in xy
-	if rule[3]:
-		data = np.transpose(data, (0, 2, 1))
-	return data
-
-def simple_augment_reverse(data, rule):
-	assert np.size(rule) == 4
-	assert len(data.shape) == 5
-	# transpose in xy
-	if rule[3]:
-		# data = np.transpose(data, (0, 1, 2, 4, 3))
-		data = data.permute(0, 1, 2, 4, 3)
-	# y reflection
-	if rule[2]:
-		# data = data[:, :, :, ::-1, :]
-		data = torch.flip(data, [3])
-	# x reflection
-	if rule[1]:
-		# data = data[:, :, :, :, ::-1]
-		data = torch.flip(data, [4])
-	# z reflection
-	if rule[0]:
-		# data = data[:, :, ::-1, :, :]
-		data = torch.flip(data, [2])
-	return data
-
-def simple_augment_debug(data, rule):
-	assert np.size(rule) == 4
-	assert data.ndim == 5
-	# z reflection
-	if rule[0]:
-		data = data[:, :, ::-1, :, :]
-	# x reflection
-	if rule[1]:
-		data = data[:, :, :, :, ::-1]
-	# y reflection
-	if rule[2]:
-		data = data[:, :, :, ::-1, :]
-	# transpose in xy
-	if rule[3]:
-		data = np.transpose(data, (0, 1, 2, 4, 3))
-	return data
-
-def collate_fn(batchs):
-	out_input = []
-	for batch in batchs:
-		out_input.append(torch.from_numpy(batch['image']))
-	
-	out_input = torch.stack(out_input, 0)
-	return {'image':out_input}
 
 class Provider(object):
 	def __init__(self, stage, cfg):
@@ -340,7 +316,6 @@ class Provider(object):
 			if self.is_cuda:
 				batch[0] = batch[0].cuda()
 				batch[1] = batch[1].cuda()
-				batch[2] = batch[2].cuda()
 			return batch
 		except StopIteration:
 			self.epoch += 1
@@ -350,7 +325,6 @@ class Provider(object):
 			if self.is_cuda:
 				batch[0] = batch[0].cuda()
 				batch[1] = batch[1].cuda()
-				batch[2] = batch[2].cuda()
 			return batch
 
 def show(img3d):
@@ -379,7 +353,7 @@ if __name__ == '__main__':
 	seed = 555
 	np.random.seed(seed)
 	random.seed(seed)
-	cfg_file = 'ssl_3aug_suhu_mse_lr0001_snemi3d_model512.yaml'
+	cfg_file = 'pretraining_snemi3d.yaml'
 	with open('./config/' + cfg_file, 'r') as f:
 		cfg = AttrDict( yaml.load(f) )
 	
@@ -390,7 +364,7 @@ if __name__ == '__main__':
 	t = time.time()
 	for i in range(0, 20):
 		t1 = time.time()
-		tmp_data, gt, _ = iter(data).__next__()
+		tmp_data, gt = iter(data).__next__()
 		print('single cost time: ', time.time()-t1)
 		tmp_data = np.squeeze(tmp_data)
 		gt = np.squeeze(gt)

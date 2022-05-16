@@ -19,12 +19,8 @@ class Provider_valid(Dataset):
         if valid_data is not None:
             valid_dataset_name = valid_data
         else:
-            try:
-                valid_dataset_name = cfg.DATA.valid_dataset
-                print('valid on valid dataset!')
-            except:
-                valid_dataset_name = cfg.DATA.dataset_name
-                print('valid on train dataset!')
+            valid_dataset_name = cfg.DATA.dataset_name
+        print('valid dataset:', valid_dataset_name)
 
         # basic settings
         # the input size of network
@@ -57,11 +53,8 @@ class Provider_valid(Dataset):
             self.train_labels = ['cremiC_labels.h5']
         elif valid_dataset_name == 'cremi-all':
             self.sub_path = 'cremi'
-            self.train_datasets = ['cremiC_inputs_interp.h5']
-            self.train_labels = ['cremiC_labels.h5']
-            # self.sub_path = 'cremi'
-            # self.train_datasets = ['cremiA_inputs_interp.h5', 'cremiB_inputs_interp.h5', 'cremiC_inputs_interp.h5']
-            # self.train_labels = ['cremiA_labels.h5', 'cremiB_labels.h5', 'cremiC_labels.h5']
+            self.train_datasets = ['cremiA_inputs_interp.h5', 'cremiB_inputs_interp.h5', 'cremiC_inputs_interp.h5']
+            self.train_labels = ['cremiA_labels.h5', 'cremiB_labels.h5', 'cremiC_labels.h5']
         elif valid_dataset_name == 'snemi3d-ac3' or valid_dataset_name == 'snemi3d':
             self.sub_path = 'snemi3d'
             self.train_datasets = ['AC3_inputs.h5']
@@ -81,10 +74,6 @@ class Provider_valid(Dataset):
         self.folder_name = os.path.join(cfg.DATA.data_folder, self.sub_path)
         assert len(self.train_datasets) == len(self.train_labels)
 
-        # split validation data
-        # if valid_dataset_name == 'snemi3d-ac4':
-        #     self.test_split = 100
-        # else:
         if test_split is None:
             self.test_split = cfg.DATA.test_split
         else:
@@ -293,11 +282,10 @@ class Provider_valid(Dataset):
 
     def get_gt_lb(self, num_data=0):
         lbs = self.labels[num_data].copy()
-        lbs = lbs[self.valid_padding[0]:-self.valid_padding[0], \
+        return lbs[self.valid_padding[0]:-self.valid_padding[0], \
                   self.valid_padding[1]:-self.valid_padding[1], \
                   self.valid_padding[2]:-self.valid_padding[2]]
-        return lbs
-    
+
     def get_raw_data(self, num_data=0):
         out = self.dataset[num_data].copy()
         return out[self.valid_padding[0]:-self.valid_padding[0], \
@@ -311,12 +299,11 @@ if __name__ == '__main__':
     import time
     import torch
     from utils.show import show_one
-    from sklearn.metrics import f1_score
 
     seed = 555
     np.random.seed(seed)
     random.seed(seed)
-    cfg_file = 'seg_onlylb_suhu_wbce_lr01_snemi3d_data25.yaml'
+    cfg_file = 'seg_snemi3d_d5_1024_u200.yaml'
     with open('./config/' + cfg_file, 'r') as f:
         cfg = AttrDict( yaml.load(f) )
     
@@ -327,38 +314,15 @@ if __name__ == '__main__':
     data = Provider_valid(cfg)
     dataloader = torch.utils.data.DataLoader(data, batch_size=1, num_workers=0,
                                              shuffle=False, drop_last=False, pin_memory=True)
-    
-    gt_affs = data.get_gt_affs()
-    pred = np.random.random(tuple(gt_affs.shape)).astype(np.float32)
-    pred[pred <= 0.5] = 0
-    pred[pred > 0.5] = 1
-    gt_affs = gt_affs.astype(np.uint8)
-    pred = pred.astype(np.uint8)
-    gt_affs = gt_affs.flatten()
-    pred = pred.flatten()
-    f1 = f1_score(1 - gt_affs, 1- pred)
-    print(f1)
 
-    # t = time.time()
-    # for k, batch in enumerate(dataloader, 0):
-    #     inputs, target, wrightmap = batch
-    #     target = target.data.numpy()
-    #     data.add_vol(target[0])
-    # out_affs = data.get_results()
-    # for k in range(out_affs.shape[1]):
-    #     affs_xy = out_affs[2, k]
-    #     affs_xy = (affs_xy * 255).astype(np.uint8)
-    #     Image.fromarray(affs_xy).save(os.path.join(out_path, str(k).zfill(4)+'.png'))
-    #     # print('single cost time: ', time.time()-t1)
-    #     # tmp_data = np.squeeze(tmp_data)
-    #     # if cfg.MODEL.model_type == 'mala':
-    #     #     tmp_data = tmp_data[14:-14,106:-106,106:-106]
-    #     # affs_xy = affs[2]
-    #     # weightmap_xy = weightmap[2]
-
-    #     # img_data = show_one(tmp_data)
-    #     # img_affs = show_one(affs_xy)
-    #     # img_weight = show_one(weightmap_xy)
-    #     # im_cat = np.concatenate([img_data, img_affs, img_weight], axis=1)
-    #     # Image.fromarray(im_cat).save(os.path.join(out_path, str(i).zfill(4)+'.png'))
-    # print(time.time() - t)
+    t = time.time()
+    for k, batch in enumerate(dataloader, 0):
+        inputs, target, wrightmap = batch
+        target = target.data.numpy()
+        data.add_vol(target[0])
+    out_affs = data.get_results()
+    for k in range(out_affs.shape[1]):
+        affs_xy = out_affs[2, k]
+        affs_xy = (affs_xy * 255).astype(np.uint8)
+        Image.fromarray(affs_xy).save(os.path.join(out_path, str(k).zfill(4)+'.png'))
+    print(time.time() - t)

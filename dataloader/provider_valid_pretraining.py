@@ -1,15 +1,9 @@
 import os
-import cv2
 import h5py
-import math
 import random
 import numpy as np
-from PIL import Image
 from torch.utils.data import Dataset
-from utils.seg_util import mknhood3d, genSegMalis
-from utils.aff_util import seg_to_affgraph
 
-import pdb
 
 class Provider_valid(Dataset):
     def __init__(self, cfg, if_overlap=True):
@@ -55,9 +49,9 @@ class Provider_valid(Dataset):
             self.sub_path = 'snemi3d'
             self.train_datasets = ['AC3_inputs.h5']
             self.train_labels = ['AC3_labels.h5']
-        elif cfg.DATA.dataset_name == 'snemi3d-ac4-noise25':
+        elif cfg.DATA.dataset_name == 'snemi3d-ac4':
             self.sub_path = 'snemi3d'
-            self.train_datasets = ['AC4_noise25.h5']
+            self.train_datasets = ['AC4_inputs.h5']
             self.train_labels = ['AC4_labels.h5']
         elif cfg.DATA.dataset_name == 'fib-25':
             self.sub_path = 'fib'
@@ -73,8 +67,8 @@ class Provider_valid(Dataset):
         # split validation data
         self.test_split = cfg.DATA.test_split
 
-        self.if_order_aug = cfg.DATA.if_order_aug
-        self.if_mask_aug = cfg.DATA.if_mask_aug
+        self.if_order_aug = False
+        self.if_mask_aug = cfg.DATA.if_mask_aug_unlabel
         if self.if_mask_aug:
             if 'snemi3d' in cfg.DATA.dataset_name and cfg.MODEL.model_type == 'superhuman':
                 mask_path = os.path.join(cfg.DATA.data_folder, 'snemi3d', 'masks_snemi3d_suhu.h5')
@@ -96,7 +90,8 @@ class Provider_valid(Dataset):
             f_raw = h5py.File(os.path.join(self.folder_name, self.train_datasets[k]), 'r')
             data = f_raw['main'][:]
             f_raw.close()
-            data = data[-self.test_split:]
+            # The default is to use the top 25 sections of volumes as validation set to select models for simplicity
+            data = data[:self.test_split]
             self.dataset.append(data)
 
         self.origin_data_shape = list(self.dataset[0].shape)
@@ -104,18 +99,6 @@ class Provider_valid(Dataset):
         # padding by 'reflect' mode for mala network
         if cfg.MODEL.model_type == 'mala':
             raise NotImplementedError
-            # self.stride = self.out_size           # [25, 56, 56]
-            # self.valid_padding = self.net_padding # [14, 106, 106]
-            # if 'cremi' in cfg.DATA.dataset_name:
-            #     # z: 2 = 50 // 25
-            #     # y: 23 = ceil(1250 / 56)
-            #     self.num_zyx = [2, 23, 23]
-            # elif 'snemi3d' in cfg.DATA.dataset_name:
-            #     # z: 2 = 50 // 25
-            #     # y: 19 = ceil(1024 / 56)
-            #     self.num_zyx = [2, 19, 19]
-            # else:
-            #     raise AttributeError('No this dataset type!')
         else:
             if self.if_overlap:
                 self.stride = [15, 80, 80]
@@ -132,15 +115,6 @@ class Provider_valid(Dataset):
                     raise AttributeError('No this dataset type!')
             else:
                 raise NotImplementedError
-                # self.stride = [18, 160, 160]
-                # if 'cremi' in cfg.DATA.dataset_name:
-                #     self.valid_padding = [2, 15, 15]
-                #     self.num_zyx = [3, 8, 8]
-                # elif 'snemi3d' in cfg.DATA.dataset_name:
-                #     self.valid_padding = [2, 48, 48]
-                #     self.num_zyx = [3, 7, 7]
-                # else:
-                #     raise AttributeError('No this dataset type!')
 
         for k in range(len(self.dataset)):
             self.dataset[k] = np.pad(self.dataset[k], ((self.valid_padding[0], self.valid_padding[0]), \
@@ -192,15 +166,15 @@ class Provider_valid(Dataset):
 
         if self.if_order_aug:
             imgs = order_aug(imgs)
-        # if self.if_mask_aug:
-        #     mask = self.masks[index]
-        #     imgs = imgs * mask
+        if self.if_mask_aug:
+            mask = self.masks[index]
+            imgs = imgs * mask
 
         imgs = imgs[np.newaxis, ...]
         gt = gt[np.newaxis, ...]
         imgs = np.ascontiguousarray(imgs, dtype=np.float32)
         gt = np.ascontiguousarray(gt, dtype=np.float32)
-        return imgs, gt, gt
+        return imgs, gt
 
     def __len__(self):
         return self.iters_num
@@ -274,13 +248,12 @@ if __name__ == '__main__':
     from attrdict import AttrDict
     import time
     import torch
-    from utils.show import show_one
-    from sklearn.metrics import f1_score
+    from PIL import Image
 
     seed = 555
     np.random.seed(seed)
     random.seed(seed)
-    cfg_file = 'seg_onlylb_suhu_wbce_lr01_snemi3d_data25.yaml'
+    cfg_file = 'pretraining_snemi3d.yaml'
     with open('./config/' + cfg_file, 'r') as f:
         cfg = AttrDict( yaml.load(f) )
     
@@ -291,38 +264,16 @@ if __name__ == '__main__':
     data = Provider_valid(cfg)
     dataloader = torch.utils.data.DataLoader(data, batch_size=1, num_workers=0,
                                              shuffle=False, drop_last=False, pin_memory=True)
-    
-    gt_affs = data.get_gt_affs()
-    pred = np.random.random(tuple(gt_affs.shape)).astype(np.float32)
-    pred[pred <= 0.5] = 0
-    pred[pred > 0.5] = 1
-    gt_affs = gt_affs.astype(np.uint8)
-    pred = pred.astype(np.uint8)
-    gt_affs = gt_affs.flatten()
-    pred = pred.flatten()
-    f1 = f1_score(1 - gt_affs, 1- pred)
-    print(f1)
 
-    # t = time.time()
-    # for k, batch in enumerate(dataloader, 0):
-    #     inputs, target, wrightmap = batch
-    #     target = target.data.numpy()
-    #     data.add_vol(target[0])
-    # out_affs = data.get_results()
-    # for k in range(out_affs.shape[1]):
-    #     affs_xy = out_affs[2, k]
-    #     affs_xy = (affs_xy * 255).astype(np.uint8)
-    #     Image.fromarray(affs_xy).save(os.path.join(out_path, str(k).zfill(4)+'.png'))
-    #     # print('single cost time: ', time.time()-t1)
-    #     # tmp_data = np.squeeze(tmp_data)
-    #     # if cfg.MODEL.model_type == 'mala':
-    #     #     tmp_data = tmp_data[14:-14,106:-106,106:-106]
-    #     # affs_xy = affs[2]
-    #     # weightmap_xy = weightmap[2]
-
-    #     # img_data = show_one(tmp_data)
-    #     # img_affs = show_one(affs_xy)
-    #     # img_weight = show_one(weightmap_xy)
-    #     # im_cat = np.concatenate([img_data, img_affs, img_weight], axis=1)
-    #     # Image.fromarray(im_cat).save(os.path.join(out_path, str(i).zfill(4)+'.png'))
-    # print(time.time() - t)
+    t = time.time()
+    for k, batch in enumerate(dataloader, 0):
+        inputs, target = batch
+        inputs = inputs.data.numpy()
+        target = target.data.numpy()
+        data.add_vol(inputs[0])
+    out_affs = data.get_results()
+    for k in range(out_affs.shape[1]):
+        affs_xy = out_affs[0, k]
+        affs_xy = (affs_xy * 255).astype(np.uint8)
+        Image.fromarray(affs_xy).save(os.path.join(out_path, str(k).zfill(4)+'.png'))
+    print(time.time() - t)

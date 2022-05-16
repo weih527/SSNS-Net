@@ -1,16 +1,9 @@
-'''
-Descripttion: 
-version: 0.0
-Author: Wei Huang
-Date: 2021-11-03 16:40:50
-'''
 from __future__ import absolute_import
 from __future__ import print_function
 from __future__ import division
 
 import os
 import sys
-import cv2
 import h5py
 import math
 import time
@@ -18,15 +11,8 @@ import torch
 import random
 import numpy as np
 from PIL import Image
-import multiprocessing
-from joblib import Parallel
-from joblib import delayed
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
-
-# from utils.augmentation import SimpleAugment, RandomRotationAugment
-# from utils.augmentation import IntensityAugment, ElasticAugment
-# from utils.consistency_aug import resize_3d, gen_mask, add_gauss_noise, add_gauss_blur
 
 from utils.consistency_aug_perturbations import Rescale
 from utils.consistency_aug_perturbations import Filp
@@ -36,18 +22,15 @@ from utils.consistency_aug_perturbations import GaussNoise
 from utils.consistency_aug_perturbations import Cutout
 from utils.consistency_aug_perturbations import SobelFilter
 from utils.consistency_aug_perturbations import Mixup
-# from utils.consistency_aug_perturbations import Misalign  # implement in Elastic
 from utils.consistency_aug_perturbations import Elastic
 from utils.consistency_aug_perturbations import Artifact
 from utils.consistency_aug_perturbations import Missing
 from utils.consistency_aug_perturbations import BlurEnhanced
 
+
 class Train(Dataset):
 	def __init__(self, cfg):
 		super(Train, self).__init__()
-		# multiprocess settings
-		num_cores = multiprocessing.cpu_count()
-		self.parallel = Parallel(n_jobs=num_cores, backend='threading')
 		self.cfg = cfg
 		self.model_type = cfg.MODEL.model_type
 		self.per_mode = cfg.DATA.per_mode
@@ -166,18 +149,6 @@ class Train(Dataset):
 		# perturbations
 		self.perturbations_init()
 
-		# # mask size
-		# if cfg.MODEL.model_type == 'mala':
-		# 	self.min_mask_size = [5, 5, 5]
-		# 	self.max_mask_size = [8, 12, 12]
-		# 	self.min_mask_counts = 40
-		# 	self.max_mask_counts = 60
-		# else:
-		# 	self.min_mask_size = [5, 10, 10]
-		# 	self.max_mask_size = [10, 20, 20]
-		# 	self.min_mask_counts = 60
-		# 	self.max_mask_counts = 100
-
 	def __getitem__(self, index):
 		# random select one dataset if contain many datasets
 		k = random.randint(0, len(self.train_datasets)-1)
@@ -233,7 +204,7 @@ class Train(Dataset):
 		self.per_missing = Missing(miss_fully_ratio=0.2, miss_part_ratio=0.5)
 		self.per_blurenhanced = BlurEnhanced(blur_fully_ratio=0.5, blur_part_ratio=0.7)
 
-	def apply_perturbations(self, data, auxi, mode=1):
+	def apply_perturbations(self, data, auxi=None, mode=1):
 		all_pers = [self.if_scale_aug, self.if_filp_aug, self.if_rotation_aug, self.if_intensity_aug, \
 					self.if_noise_aug, self.if_blur_aug, self.if_mask_aug, self.if_sobel_aug, \
 					self.if_mixup_aug, self.if_misalign_aug, self.if_elastic_aug, self.if_artifact_aug, \
@@ -292,7 +263,7 @@ class Train(Dataset):
 			if rand_per == 7:
 				data = self.per_sobel(data)
 			# mixup
-			if rand_per == 8:
+			if rand_per == 8 and auxi is not None:
 				data = self.per_mixup(data, auxi)
 			# misalign
 			if rand_per == 9:
@@ -398,7 +369,7 @@ if __name__ == '__main__':
 	seed = 555
 	np.random.seed(seed)
 	random.seed(seed)
-	cfg_file = 'seg_consist_suhu_snemi3d_d10_u200_pre400k_w1_flip.yaml'
+	cfg_file = 'seg_snemi3d_d5_1024_u200.yaml'
 	with open('./config/' + cfg_file, 'r') as f:
 		cfg = AttrDict( yaml.load(f) )
 	
