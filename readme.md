@@ -2,7 +2,7 @@
 
 Wei Huang, Chang Chen, Zhiwei Xiong(*), Yueyi Zhang, Xuejin Chen, Xiaoyan Sun, Feng Wu
 
-*Corresponding Author (zwxiong@ustc.edu.cn)
+*Corresponding Author
 
 University of Science and Technology of China (USTC)
 
