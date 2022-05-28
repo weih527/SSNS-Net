@@ -39,7 +39,7 @@ TRAIN:
     loss_func: 'BCELoss'   # 'MSELoss', 'BCELoss'
     loss_func_unlabel: 'MSELoss'
     weight_unlabel: 1.0
-    weight_unlabel_fixed: False
+    weight_unlabel_fixed: True
     ema_decay: 0.999
 
     opt_type: 'adam'
